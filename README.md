@@ -15,7 +15,7 @@ def addsub(x, y):
 compiled with the `compile_ptx_soa()` function where:
 
 - Arguments are of `int32` type
-- The return type is a tuple of `int32`
+- The return type is a tuple of `(int32, int32)`
 
 compiles to PTX equivalent to th C function:
 
