@@ -8,12 +8,19 @@ from numba.cuda.compiler import compile_cuda
 
 class SoACallConv(BaseCallConv):
     """
-    Calling convention aimed at matching the CUDA C/C++ ABI. The implemented
-    function signature is:
+    Calling convention where returned values are stored through pointers
+    provided as arguments.
 
-        <Python return type> (<Python arguments>)
+    - If the return type is a scalar, the first argument is a pointer to the
+      return type.
+    - If the return type is a tuple of length N, then the first N arguments are
+      pointers to each of the elements of the tuple.
 
-    Exceptions are unsupported in this convention
+    In equivalent C, the prototype of a function with this calling convention
+    would take the following form:
+
+        void <func_name>(<Tuple item 1>*, ..., <Tuple item N>*,
+                         <Python arguments... >);
     """
 
     def _make_call_helper(self, builder):
@@ -25,11 +32,11 @@ class SoACallConv(BaseCallConv):
 
     def return_user_exc(self, builder, exc, exc_args=None, loc=None,
                         func_name=None):
-        msg = "Python exceptions are unsupported in the CUDA C/C++ ABI"
+        msg = "Python exceptions are unsupported when returning in SoA form"
         raise NotImplementedError(msg)
 
     def return_status_propagate(self, builder, status):
-        msg = "Return status is unsupported in the CUDA C/C++ ABI"
+        msg = "Return status is unsupported when returning in SoA form"
         raise NotImplementedError(msg)
         pass
 
@@ -70,16 +77,7 @@ class SoACallConv(BaseCallConv):
         """
         Call the Numba-compiled *callee*.
         """
-        raise NotImplementedError("Can't call SoA return function direct")
-        retty = callee.args[0].type.pointee
-        retvaltmp = cgutils.alloca_once(builder, retty)
-        builder.store(cgutils.get_null_value(retty), retvaltmp)
-
-        arginfo = self._get_arg_packer(argtys)
-        realargs = [retvaltmp] + list(arginfo.as_arguments(builder, args))
-        code = builder.call(callee, realargs)
-        out = self.context.get_returned_value(builder, resty, code)
-        return None, out
+        raise NotImplementedError("Can't call SoA return function directly")
 
 
 def soa_wrap_function(context, lib, fndesc, nvvm_options):
