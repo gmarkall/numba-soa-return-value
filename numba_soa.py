@@ -1,5 +1,6 @@
 from llvmlite import ir
-from numba.core import sigutils
+from numba import types
+from numba.core import cgutils, sigutils
 from numba.core.callconv import BaseCallConv
 from numba.core.compiler_lock import global_compiler_lock
 from numba.cuda.compiler import compile_cuda
@@ -38,7 +39,11 @@ class SoACallConv(BaseCallConv):
         """
         arginfo = self._get_arg_packer(argtypes)
         argtypes = list(arginfo.argument_types)
-        fnty = ir.FunctionType(self.get_return_type(restype), argtypes)
+        if isinstance(restype, types.BaseTuple):
+            return_types = [self.get_return_type(t) for t in restype.types]
+        else:
+            return_types = [self.get_return_type(restype)]
+        fnty = ir.FunctionType(ir.VoidType(), return_types + argtypes)
         return fnty
 
     def decorate_function(self, fn, args, fe_argtypes, noalias=False):
@@ -50,24 +55,31 @@ class SoACallConv(BaseCallConv):
         arginfo.assign_names(self.get_arguments(fn),
                              ['arg.' + a for a in args])
 
-    def get_arguments(self, func):
+    def get_arguments(self, func, restype):
         """
         Get the Python-level arguments of LLVM *func*.
         """
-        return func.args
+        if isinstance(restype, types.BaseTuple):
+            n_returns = len(restype.types)
+        else:
+            n_returns = 1
+
+        return func.args[n_returns:]
 
     def call_function(self, builder, callee, resty, argtys, args):
         """
         Call the Numba-compiled *callee*.
         """
+        raise NotImplementedError("Can't call SoA return function direct")
+        retty = callee.args[0].type.pointee
+        retvaltmp = cgutils.alloca_once(builder, retty)
+        builder.store(cgutils.get_null_value(retty), retvaltmp)
+
         arginfo = self._get_arg_packer(argtys)
-        realargs = arginfo.as_arguments(builder, args)
+        realargs = [retvaltmp] + list(arginfo.as_arguments(builder, args))
         code = builder.call(callee, realargs)
         out = self.context.get_returned_value(builder, resty, code)
         return None, out
-
-    def get_return_type(self, ty):
-        return self.context.data_model_manager[ty].get_return_type()
 
 
 def soa_wrap_function(context, lib, fndesc, nvvm_options):
@@ -84,27 +96,35 @@ def soa_wrap_function(context, lib, fndesc, nvvm_options):
     # Determine the caller (C ABI) and wrapper (Numba ABI) function types
     argtypes = fndesc.argtypes
     restype = fndesc.restype
-    c_call_conv = SoACallConv(context)
-    wrapfnty = c_call_conv.get_function_type(restype, argtypes)
-    fnty = context.call_conv.get_function_type(fndesc.restype, argtypes)
+    soa_call_conv = SoACallConv(context)
+    wrapperty = soa_call_conv.get_function_type(restype, argtypes)
+    calleety = context.call_conv.get_function_type(restype, argtypes)
 
     # Create a new module and declare the callee
     wrapper_module = context.create_module("cuda.soa.wrapper")
-    func = ir.Function(wrapper_module, fnty, fndesc.llvm_func_name)
+    callee = ir.Function(wrapper_module, calleety, fndesc.llvm_func_name)
 
     # Define the caller - populate it with a call to the callee and return
     # its return value
 
-    wrapfn = ir.Function(wrapper_module, wrapfnty, device_function_name)
-    builder = ir.IRBuilder(wrapfn.append_basic_block(''))
+    wrapper = ir.Function(wrapper_module, wrapperty, device_function_name)
+    builder = ir.IRBuilder(wrapper.append_basic_block(''))
 
     arginfo = context.get_arg_packer(argtypes)
-    callargs = arginfo.from_arguments(builder, wrapfn.args)
+    wrapper_args = soa_call_conv.get_arguments(wrapper, restype)
+    callargs = arginfo.as_arguments(builder, wrapper_args)
     # We get (status, return_value), but we ignore the status since we
-    # can't propagate it through the C ABI anyway
+    # can't propagate it through the SoA ABI anyway
     _, return_value = context.call_conv.call_function(
-        builder, func, restype, argtypes, callargs)
-    builder.ret(return_value)
+        builder, callee, restype, argtypes, callargs)
+
+    if isinstance(restype, types.BaseTuple):
+        for i in range(len(restype.types)):
+            val = builder.extract_value(return_value, i)
+            builder.store(val, wrapper.args[i])
+    else:
+        builder.store(return_value, wrapper.args[0])
+    builder.ret_void()
 
     library.add_ir_module(wrapper_module)
     library.finalize()
